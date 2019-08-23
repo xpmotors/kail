@@ -11,7 +11,7 @@ import (
 
 	logutil "github.com/boz/go-logutil"
 	logutil_logrus "github.com/boz/go-logutil/logrus"
-	"github.com/boz/kail"
+	"github.com/xpmotors/kail"
 	"github.com/boz/kcache/nsname"
 	"github.com/sirupsen/logrus"
 	kingpin "gopkg.in/alecthomas/kingpin.v2"

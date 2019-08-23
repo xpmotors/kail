@@ -1,4 +1,4 @@
-module github.com/boz/kail
+module github.com/xpmotors/kail
 
 go 1.12
 
