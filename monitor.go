@@ -1,253 +1,234 @@
 package kail
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"io"
 	"time"
 
 	"k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/kubernetes"
+	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
 
-	lifecycle "github.com/boz/go-lifecycle"
-	logutil "github.com/boz/go-logutil"
-	"github.com/boz/kcache"
-	"github.com/boz/kcache/nsname"
-	"github.com/boz/kcache/types/pod"
+	"github.com/boz/go-lifecycle"
+	"github.com/boz/go-logutil"
 )
 
 const (
-	eventBufsiz = 500
+	logBufsiz          = 1024 * 16 // 16k max message size
+	monitorDeliverWait = time.Millisecond
 )
 
-type Controller interface {
-	Events() <-chan Event
-	Close()
+var (
+	canaryLog = []byte("unexpected stream type \"\"")
+)
+
+type monitorConfig struct {
+	since time.Duration
+	taillines *int64
+	retry bool
+}
+
+type monitor interface {
+	Shutdown()
 	Done() <-chan struct{}
 }
 
-func NewController(
-	ctx context.Context,
-	cs kubernetes.Interface,
-	rc *rest.Config,
-	pcontroller pod.Controller,
-	filter ContainerFilter,
-	since time.Duration,
-	taillines *int64) (Controller, error) {
-
-	pods, err := pcontroller.Subscribe()
-	if err != nil {
-		return nil, err
-	}
-
-	initial, err := pods.Cache().List()
-	if err != nil {
-		pods.Close()
-		return nil, err
-	}
-
+func newMonitor(c *controller, source EventSource, config monitorConfig) monitor {
 	lc := lifecycle.New()
-	go lc.WatchContext(ctx)
+	go lc.WatchContext(c.ctx)
 
-	log := logutil.FromContextOrDefault(ctx)
-	log = log.WithComponent("kail.controller")
+	log := c.log.WithComponent(
+		fmt.Sprintf("monitor [%v]", source))
 
-	c := &controller{
-		cs:        cs,
-		rc:        rc,
-		pods:      pods,
-		filter:    filter,
-		mconfig:   monitorConfig{since: since, taillines:taillines, retry:false},
-		eventch:   make(chan Event, eventBufsiz),
-		monitorch: make(chan eventSource),
-		monitors:  make(map[nsname.NSName]podMonitors),
-		log:       log,
-		ctx:       ctx,
-		lc:        lc,
+	m := &_monitor{
+		rc:      c.rc,
+		source:  source,
+		config:  config,
+		eventch: c.eventch,
+		log:     log,
+		lc:      lc,
+		ctx:     c.ctx,
 	}
 
-	go c.run(initial)
-
-	return c, nil
-}
-
-type controller struct {
-	cs     kubernetes.Interface
-	rc     *rest.Config
-	pods   pod.Subscription
-	filter ContainerFilter
-
-	eventch   chan Event
-	monitorch chan eventSource
-
-	monitors monitors
-	mconfig  monitorConfig
-
-	log logutil.Log
-	ctx context.Context
-	lc  lifecycle.Lifecycle
-}
-
-type podMonitors map[eventSource]monitor
-type monitors map[nsname.NSName]podMonitors
-
-func (c *controller) Events() <-chan Event {
-	return c.eventch
-}
-
-func (c *controller) Done() <-chan struct{} {
-	return c.lc.Done()
-}
-
-func (c *controller) Close() {
-	c.lc.Shutdown(nil)
-}
-
-func (c *controller) run(initial []*v1.Pod) {
-	defer c.log.Un(c.log.Trace("run"))
-	defer c.lc.ShutdownCompleted()
-
-	peventch := c.pods.Events()
-	shutdownch := c.lc.ShutdownRequest()
-	draining := false
-
-	c.createInitialMonitors(initial)
-
-	for {
-
-		c.log.Debugf("loop draining:%v monitors:%v", draining, len(c.monitors))
-
-		if draining && len(c.monitors) == 0 {
-			break
-		}
-
-		select {
-
-		case err := <-shutdownch:
-			c.log.Debugf("shutdown requested: %v", err)
-
-			c.lc.ShutdownInitiated(err)
-			shutdownch = nil
-			draining = true
-
-		case ev, ok := <-peventch:
-			if !ok {
-				c.log.Debugf("pods closed")
-
-				peventch = nil
-
-				if !draining {
-					c.lc.ShutdownInitiated(nil)
-					shutdownch = nil
-					draining = true
-				}
-
-				break
-			}
-
-			if !draining {
-				c.handlePodEvent(ev)
-			}
-
-		case source := <-c.monitorch:
-			if pms, ok := c.monitors[source.id]; ok {
-				if _, ok := pms[source]; ok {
-					c.log.Debugf("removing source %v", source)
-					delete(pms, source)
-					if len(pms) == 0 {
-						c.log.Debugf("removing pod %v", source.id)
-						delete(c.monitors, source.id)
-					}
-					break
-				}
-			}
-			c.log.Warnf("attempted to remove unknown source: %v", source)
-		}
-	}
-
-	c.pods.Close()
-	<-c.pods.Done()
-}
-
-func (c *controller) handlePodEvent(ev pod.Event) {
-	pod := ev.Resource()
-	id := nsname.ForObject(pod)
-
-	c.log.Debugf("event %v %v/%v",
-		ev.Type(), ev.Resource().GetName(), ev.Resource().GetNamespace())
-
-	if ev.Type() == kcache.EventTypeDelete {
-		if pms, ok := c.monitors[id]; ok {
-			for _, pm := range pms {
-				pm.Shutdown()
-			}
-		}
-		return
-	}
-
-	c.ensureMonitorsForPod(pod)
-}
-
-func (c *controller) ensureMonitorsForPod(pod *v1.Pod) {
-	id, sources := sourcesForPod(c.filter, pod)
-
-	c.log.Debugf("pod %v/%v: %v containers ready",
-		pod.GetNamespace(), pod.GetName(), len(sources))
-
-	// delete monitors of not-ready containers
-	if pms, ok := c.monitors[id]; ok {
-		for source, pm := range pms {
-			if !sources[source] {
-				pm.Shutdown()
-			}
-		}
-	}
-
-	if len(sources) == 0 {
-		return
-	}
-
-	pms, ok := c.monitors[id]
-	if !ok {
-		pms = make(map[eventSource]monitor)
-	}
-
-	for source, _ := range sources {
-		if _, ok := pms[source]; ok {
-			continue
-		}
-		pms[source] = c.createMonitor(source)
-	}
-
-	c.monitors[id] = pms
-}
-
-func (c *controller) createMonitor(source eventSource) monitor {
-	defer c.log.Un(c.log.Trace("createMonitor(%v)", source))
-
-	m := newMonitor(c, &source, c.mconfig)
-
-	go func() {
-
-		select {
-		case <-m.Done():
-		case <-c.lc.ShuttingDown():
-			m.Shutdown()
-			<-m.Done()
-		}
-
-		select {
-		case c.monitorch <- source:
-		case <-c.lc.Done():
-			c.log.Warnf("done before monitor %v unregistered", source)
-		}
-	}()
+	go m.run()
 
 	return m
 }
 
-func (c *controller) createInitialMonitors(pods []*v1.Pod) {
-	defer c.log.Un(c.log.Trace("createInitialMonitors(pods=%v)", len(pods)))
-	for _, pod := range pods {
-		c.ensureMonitorsForPod(pod)
+type _monitor struct {
+	rc      *rest.Config
+	source  EventSource
+	config  monitorConfig
+	eventch chan<- Event
+	log     logutil.Log
+	lc      lifecycle.Lifecycle
+	ctx     context.Context
+}
+
+func (m *_monitor) Shutdown() {
+	m.lc.ShutdownAsync(nil)
+}
+
+func (m *_monitor) Done() <-chan struct{} {
+	return m.lc.Done()
+}
+
+func (m *_monitor) run() {
+	defer m.log.Un(m.log.Trace("run"))
+	defer m.lc.ShutdownCompleted()
+
+	ctx, cancel := context.WithCancel(m.ctx)
+
+	client, err := m.makeClient(ctx)
+	if err != nil {
+		m.lc.ShutdownInitiated(err)
+		cancel()
+		return
+	}
+
+	donech := make(chan struct{})
+
+	go m.mainloop(ctx, client, donech)
+
+	err = <-m.lc.ShutdownRequest()
+	m.lc.ShutdownInitiated(err)
+	cancel()
+
+	<-donech
+}
+
+func (m *_monitor) makeClient(ctx context.Context) (corev1.CoreV1Interface, error) {
+	cs, err := kubernetes.NewForConfig(m.rc)
+	if err != nil {
+		return nil, err
+	}
+	return cs.CoreV1(), nil
+}
+
+func (m *_monitor) mainloop(
+	ctx context.Context, client corev1.CoreV1Interface, donech chan struct{}) {
+	defer m.log.Un(m.log.Trace("mainloop"))
+	defer close(donech)
+
+	// todo: backoff handled by k8 client?
+
+	sinceSecs := int64(m.config.since / time.Second)
+	since := &sinceSecs
+
+	m.log.Debugf("displaying logs since %v seconds", sinceSecs)
+
+	for i := 0; ctx.Err() == nil; i++ {
+
+		m.log.Debugf("readloop count: %v", i)
+
+		err := m.readloop(ctx, client, since)
+		switch {
+		case err == io.EOF:
+		case err == nil:
+		case ctx.Err() != nil:
+			m.lc.ShutdownAsync(nil)
+			return
+		case err == io.ErrUnexpectedEOF:
+			m.log.ErrWarn(err, "streaming EOF Error")
+			m.config.retry = true
+			m.log.Infof("retry stream namespace: %v, pod: %v, container: %v",m.source.Namespace(), m.source.Name(), m.source.Container())
+			break
+		default:
+			_, ok := err.(*apierrors.StatusError)
+			if ok{
+				m.log.ErrWarn(err, "streaming Status Error")
+				m.config.retry = true
+				m.log.Infof("retry stream namespace: %v, pod: %v, container: %v",m.source.Namespace(), m.source.Name(), m.source.Container())
+				break;
+			}
+			m.log.ErrWarn(err, "streaming done")
+			m.lc.ShutdownAsync(err)
+			return
+		}
+		sinceSecs = 1
+		time.Sleep(10 * time.Second)
+	}
+}
+
+func (m *_monitor) readloop(
+	ctx context.Context, client corev1.CoreV1Interface, since *int64) error {
+
+	defer m.log.Un(m.log.Trace("readloop"))
+
+	opts := &v1.PodLogOptions{
+		Container:    m.source.Container(),
+		Follow:       true,
+	}
+
+	if m.config.taillines != nil && m.config.retry == false {
+		opts.TailLines = m.config.taillines
+	}else {
+		opts.SinceSeconds = since
+	}
+
+	req := client.
+		Pods(m.source.Namespace()).
+		GetLogs(m.source.Name(), opts).
+		Context(ctx)
+
+	CurrentOnlines.WithLabelValues(m.source.Namespace(), m.source.Name(), m.source.Container()).Inc()
+	defer CurrentOnlines.WithLabelValues(m.source.Namespace(), m.source.Name(), m.source.Container()).Dec()
+
+	stream, err := req.Stream()
+	if err != nil {
+		return err
+	}
+
+	defer stream.Close()
+
+	logbuf := make([]byte, logBufsiz)
+	buffer := newBuffer(m.source)
+
+	for ctx.Err() == nil {
+		nread, err := stream.Read(logbuf)
+
+		switch {
+		case err == io.EOF:
+			return err
+		case ctx.Err() != nil:
+			return ctx.Err()
+		case err != nil:
+			return m.log.Err(err, "error while reading logs")
+		case nread == 0:
+			return io.EOF
+		}
+
+		log := logbuf[0:nread]
+
+		if bytes.Compare(canaryLog, log) == 0 {
+			m.log.Debugf("received 'unexpect stream type'")
+			continue
+		}
+
+		if events := buffer.process(log); len(events) > 0 {
+			m.deliverEvents(ctx, events)
+		}
+
+	}
+	return nil
+}
+
+func (m *_monitor) deliverEvents(ctx context.Context, events []Event) {
+	t := time.NewTimer(monitorDeliverWait)
+	defer t.Stop()
+
+	for i, event := range events {
+		select {
+		case m.eventch <- event:
+		case <-t.C:
+			m.log.Warnf("event buffer full. dropping %v logs", len(events)-i)
+			return
+		case <-ctx.Done():
+			return
+		}
 	}
 }

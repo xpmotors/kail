@@ -258,7 +258,7 @@ func createDSBuilder() kail.DSBuilder {
 }
 
 func createDS(ctx context.Context, cs kubernetes.Interface, dsb kail.DSBuilder) kail.DS {
-	ds, err := dsb.Create(ctx, cs)
+	ds, err := dsb.Create(ctx, cs, "")
 	kingpin.FatalIfError(err, "Error creating datasource")
 
 	select {
@@ -289,8 +289,8 @@ func listPods(ds kail.DS, filter kail.ContainerFilter) {
 
 func createController(
 	ctx context.Context, cs kubernetes.Interface, rc *rest.Config, ds kail.DS, filter kail.ContainerFilter) kail.Controller {
-
-	controller, err := kail.NewController(ctx, cs, rc, ds.Pods(), filter, *flagSince)
+	lines := int64(100)
+	controller, err := kail.NewController(ctx, cs, rc, ds.Pods(), filter, *flagSince, &lines)
 	kingpin.FatalIfError(err, "Error creating controller")
 
 	return controller

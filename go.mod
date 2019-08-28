@@ -10,6 +10,7 @@ require (
 	github.com/googleapis/gnostic v0.0.0-20170807220725-57b029087370 // indirect
 	github.com/gophercloud/gophercloud v0.3.0 // indirect
 	github.com/goreleaser/godownloader v0.0.0-20190803193356-7ef626c90bb6
+	github.com/prometheus/client_golang v0.9.3-0.20190127221311-3c4408c8b829
 	github.com/sirupsen/logrus v1.4.2
 	github.com/stretchr/testify v1.4.0
 	gopkg.in/alecthomas/kingpin.v2 v2.2.6
